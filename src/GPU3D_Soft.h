@@ -25,8 +25,14 @@
 
 namespace GPU3D
 {
+class VulkanRenderer;
+
 class SoftRenderer : public Renderer3D
 {
+    // The Vulkan renderer steps polygon edges with the same Slope/Interpolator code, so the
+    // pixels it covers match these exactly.
+    friend class VulkanRenderer;
+
 public:
     SoftRenderer();
     virtual ~SoftRenderer() override {};

@@ -1,7 +1,7 @@
 /* Experimental Vulkan renderer for the Android libretro port. */
 #pragma once
 
-#ifndef VK_USE_PLATFORM_ANDROID_KHR
+#if defined(__ANDROID__) && !defined(VK_USE_PLATFORM_ANDROID_KHR)
 #define VK_USE_PLATFORM_ANDROID_KHR 1
 #endif
 
@@ -31,13 +31,19 @@ public:
 
 private:
     struct VertexGPU {
-        u32 XY;
-        u32 ZW;
+        u32 XY;        // 12.4 fixed point
+        u32 Z;         // 24-bit Z, or W when W-buffering
+        u32 W;         // the polygon's normalized 16-bit W
         u32 Color;
         u32 Texcoord;
         u32 Attr;
         u32 TexParam;
         u32 TexPalette;
+        // At 1x, the span's Z at both edges and its start | width << 16 (width 0: the
+        // hardware's depth), for the DS's per-pixel Z interpolation in the fragment shader.
+        u32 SpanZ0;
+        u32 SpanZ1;
+        u32 SpanX;
     };
 
     struct DrawCall {
@@ -48,6 +54,7 @@ private:
         bool DepthWrite;
         bool Line;
         bool WBuffer;
+        u8 PolygonID;
     };
 
     struct ShaderConfig {
@@ -66,7 +73,8 @@ private:
     };
 
     bool CreateDevice();
-    bool CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, Buffer& result);
+    bool CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, Buffer& result,
+                      bool readback = false);
     bool CreateTargets();
     bool CreateDescriptors();
     bool CreatePipelineCache();
@@ -78,8 +86,10 @@ private:
                        VkMemoryPropertyFlags preferred = 0) const;
     void DestroyBuffer(Buffer& buffer);
     void DestroyTargets();
-    void UploadMemory();
+    bool UploadMemory();
     void BuildPolygons();
+    bool AddPolygonSpans(Polygon* polygon);
+    void AddPolygonTriangles(Polygon* polygon, bool line);
     bool CompleteSubmission();
     u32 AddVertex(Polygon* polygon, u32 index);
     VkPipeline PipelineFor(const DrawCall& draw) const;
@@ -126,8 +136,11 @@ private:
     Buffer IndexBuffer;
     std::array<Buffer, 2> ReadbackBuffers{};
 
-    std::vector<VertexGPU> Vertices;
-    std::vector<u16> Indices;
+    // The frame's geometry, written straight into the mapped vertex and index buffers.
+    VertexGPU* VertexOut = nullptr;
+    u32* IndexOut = nullptr;
+    u32 VertexCount = 0;
+    u32 IndexCount = 0;
     std::vector<DrawCall> Draws;
     std::array<u32, 256 * 192> RawOutput{};
     std::array<u32, 256 * 192> Output{};
@@ -139,6 +152,7 @@ private:
     u32 Height = 192;
     bool Ready = false;
     bool SubmissionPending = false;
+    bool OutputCurrent = false;
 };
 
 } // namespace GPU3D

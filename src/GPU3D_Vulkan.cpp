@@ -32,8 +32,10 @@ namespace GPU3D {
 
 namespace {
 constexpr VkFormat ColorFormat = VK_FORMAT_R8G8B8A8_UNORM;
-constexpr size_t MaxVertices = 10240;
-constexpr size_t MaxIndices = 2048 * 40;
+// At 1x every polygon is drawn as one quad per scanline it covers (see AddPolygonSpans).
+constexpr size_t MaxSpans = 96 * 1024;
+constexpr size_t MaxVertices = MaxSpans * 4;
+constexpr size_t MaxIndices = MaxSpans * 6;
 
 struct PushConstants {
     u32 WBuffer;
@@ -98,6 +100,15 @@ void RecordTrace(u64 build, u64 wait, u64 upload, u64 recordSubmit,
                     * NanosecondsToMilliseconds,
             static_cast<double>(TraceStats.MaximumWaitNanoseconds) * NanosecondsToMilliseconds);
     TraceStats = {};
+}
+
+// Polygon attributes the fragment shader reads (flat): blend mode, polygon ID, and in bits
+// 8 and 9 whether it faces the viewer and is W-buffered.
+u32 PolygonAttr(const Polygon* polygon) {
+    u32 attr = polygon->Attr & 0x1f00c8f0;
+    if (polygon->FacingView) attr |= 1 << 8;
+    if (polygon->WBuffer) attr |= 1 << 9;
+    return attr;
 }
 
 template <u32 Size>
@@ -170,12 +181,16 @@ bool VulkanRenderer::CreateDevice() {
     application.apiVersion = VK_API_VERSION_1_0;
     VkInstanceCreateInfo instanceInfo{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     instanceInfo.pApplicationInfo = &application;
+#if defined(__ANDROID__)
+    // The Android frame presenter can share this device, so it gets the surface extensions.
+    // Elsewhere (a Linux build, for testing) the renderer only draws offscreen.
     const char* instanceExtensions[] = {
         VK_KHR_SURFACE_EXTENSION_NAME,
         VK_KHR_ANDROID_SURFACE_EXTENSION_NAME,
     };
     instanceInfo.enabledExtensionCount = 2;
     instanceInfo.ppEnabledExtensionNames = instanceExtensions;
+#endif
     if (vkCreateInstance(&instanceInfo, nullptr, &Instance) != VK_SUCCESS)
         return Fail("could not create instance");
 
@@ -221,9 +236,11 @@ bool VulkanRenderer::CreateDevice() {
     deviceInfo.queueCreateInfoCount = 1;
     deviceInfo.pQueueCreateInfos = &queueInfo;
     deviceInfo.pEnabledFeatures = &enabled;
+#if defined(__ANDROID__)
     const char* deviceExtensions[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
     deviceInfo.enabledExtensionCount = 1;
     deviceInfo.ppEnabledExtensionNames = deviceExtensions;
+#endif
     if (vkCreateDevice(PhysicalDevice, &deviceInfo, nullptr, &Device) != VK_SUCCESS)
         return Fail("could not create device");
     vkGetDeviceQueue(Device, QueueFamily, 0, &Queue);
@@ -245,7 +262,8 @@ bool VulkanRenderer::CreateDevice() {
     return true;
 }
 
-bool VulkanRenderer::CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, Buffer& result) {
+bool VulkanRenderer::CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, Buffer& result,
+                                  bool readback) {
     result.Size = size;
     VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     info.size = size;
@@ -254,8 +272,17 @@ bool VulkanRenderer::CreateBuffer(VkDeviceSize size, VkBufferUsageFlags usage, B
     if (vkCreateBuffer(Device, &info, nullptr, &result.Handle) != VK_SUCCESS) return false;
     VkMemoryRequirements requirements{};
     vkGetBufferMemoryRequirements(Device, result.Handle, &requirements);
-    const u32 type = FindMemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
-                                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    // The CPU reads the readback buffers pixel by pixel (GetLine), so they want cached memory:
+    // uncached reads of the mapping made GetLine a quarter of the core's CPU time. Upload
+    // buffers are only written and keep the usual (write-combined) coherent memory.
+    u32 type = readback ? FindMemoryType(requirements.memoryTypeBits,
+                                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                                                 | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+                        : ~0u;
+    if (type == ~0u)
+        type = FindMemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     if (type == ~0u) return false;
     result.Coherent = (MemoryProperties.memoryTypes[type].propertyFlags
             & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
@@ -451,7 +478,8 @@ bool VulkanRenderer::CreateTargets() {
             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
             VK_IMAGE_ASPECT_COLOR_BIT, ColorImage, ColorMemory, ColorView))
         return Fail("could not create color target");
-    for (VkFormat candidate : {VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT_S8_UINT,
+    // A float depth buffer holds the DS's 24-bit depth values exactly.
+    for (VkFormat candidate : {VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT,
                                VK_FORMAT_D16_UNORM_S8_UINT}) {
         VkFormatProperties properties{};
         vkGetPhysicalDeviceFormatProperties(PhysicalDevice, candidate, &properties);
@@ -513,8 +541,8 @@ bool VulkanRenderer::CreateTargets() {
     if (vkCreateFramebuffer(Device, &fbInfo, nullptr, &FramebufferObject) != VK_SUCCESS)
         return Fail("could not create framebuffer");
     const VkDeviceSize readbackSize = static_cast<VkDeviceSize>(Width) * Height * 4;
-    return CreateBuffer(readbackSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT, ReadbackBuffers[0])
-            && CreateBuffer(readbackSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT, ReadbackBuffers[1]);
+    return CreateBuffer(readbackSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT, ReadbackBuffers[0], true)
+            && CreateBuffer(readbackSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT, ReadbackBuffers[1], true);
 }
 
 void VulkanRenderer::DestroyTargets() {
@@ -533,6 +561,7 @@ void VulkanRenderer::DestroyTargets() {
     for (auto& readback : ReadbackBuffers) DestroyBuffer(readback);
     ReadbackOutput = RawOutput.data();
     ReadbackWriteIndex = 0;
+    OutputCurrent = false;
     FramebufferObject = VK_NULL_HANDLE;
     RenderPass = VK_NULL_HANDLE;
     ColorView = DepthView = VK_NULL_HANDLE;
@@ -604,15 +633,17 @@ bool VulkanRenderer::CreatePipeline(bool translucent, bool depthEqual, bool dept
     stages[1].pName = "main";
     VkVertexInputBindingDescription binding{0, sizeof(VertexGPU), VK_VERTEX_INPUT_RATE_VERTEX};
     VkVertexInputAttributeDescription attributes[] = {
-        {0, 0, VK_FORMAT_R16G16B16A16_UINT, 0},
-        {1, 0, VK_FORMAT_R8G8B8A8_UINT, 8},
-        {2, 0, VK_FORMAT_R16G16_SINT, 12},
-        {3, 0, VK_FORMAT_R32G32B32_UINT, 16},
+        {0, 0, VK_FORMAT_R16G16_UINT, 0},
+        {1, 0, VK_FORMAT_R8G8B8A8_UINT, 12},
+        {2, 0, VK_FORMAT_R16G16_SINT, 16},
+        {3, 0, VK_FORMAT_R32G32B32_UINT, 20},
+        {4, 0, VK_FORMAT_R32G32_UINT, 4},
+        {5, 0, VK_FORMAT_R32G32B32_UINT, 32},
     };
     VkPipelineVertexInputStateCreateInfo vertexInput{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     vertexInput.vertexBindingDescriptionCount = 1;
     vertexInput.pVertexBindingDescriptions = &binding;
-    vertexInput.vertexAttributeDescriptionCount = 4;
+    vertexInput.vertexAttributeDescriptionCount = 6;
     vertexInput.pVertexAttributeDescriptions = attributes;
     VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     assembly.topology = line ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -630,6 +661,19 @@ bool VulkanRenderer::CreatePipeline(bool translucent, bool depthEqual, bool dept
     depth.depthTestEnable = VK_TRUE;
     depth.depthWriteEnable = depthWrite ? VK_TRUE : VK_FALSE;
     depth.depthCompareOp = depthEqual ? VK_COMPARE_OP_LESS_OR_EQUAL : VK_COMPARE_OP_LESS;
+    // The stencil holds what the DS keeps in its attribute buffer for translucency: bit 6 set
+    // when a translucent pixel was drawn there, bits 0-5 that polygon's ID. A translucent
+    // polygon does not blend over a pixel already blended by a translucent polygon with the
+    // same ID (games draw shadows and other overlays as several overlapping pieces that share
+    // one ID); an opaque pixel clears it. The reference is set per draw (dynamic state).
+    depth.stencilTestEnable = VK_TRUE;
+    depth.front.failOp = VK_STENCIL_OP_KEEP;
+    depth.front.passOp = VK_STENCIL_OP_REPLACE;
+    depth.front.depthFailOp = VK_STENCIL_OP_KEEP;
+    depth.front.compareOp = translucent ? VK_COMPARE_OP_NOT_EQUAL : VK_COMPARE_OP_ALWAYS;
+    depth.front.compareMask = 0x7f;
+    depth.front.writeMask = 0x7f;
+    depth.back = depth.front;
     VkPipelineColorBlendAttachmentState blend{};
     blend.colorWriteMask = 0xf;
     blend.blendEnable = translucent ? VK_TRUE : VK_FALSE;
@@ -642,9 +686,10 @@ bool VulkanRenderer::CreatePipeline(bool translucent, bool depthEqual, bool dept
     VkPipelineColorBlendStateCreateInfo colorBlend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
     colorBlend.attachmentCount = 1;
     colorBlend.pAttachments = &blend;
-    VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+                                      VK_DYNAMIC_STATE_STENCIL_REFERENCE};
     VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dynamic.dynamicStateCount = 2;
+    dynamic.dynamicStateCount = 3;
     dynamic.pDynamicStates = dynamicStates;
     VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     info.stageCount = 2;
@@ -691,11 +736,9 @@ bool VulkanRenderer::Init() {
             || !CreateBuffer(128 * 1024, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, PaletteBuffer)
             || !CreateBuffer(MaxVertices * sizeof(VertexGPU), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                              VertexBuffer)
-            || !CreateBuffer(MaxIndices * sizeof(u16), VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+            || !CreateBuffer(MaxIndices * sizeof(u32), VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
                              IndexBuffer)) return Fail("could not allocate upload buffers");
     if (!CreateTargets() || !CreateDescriptors() || !CreatePipelines()) return false;
-    Vertices.reserve(MaxVertices);
-    Indices.reserve(MaxIndices);
     Draws.reserve(2048);
     Ready = true;
     __android_log_print(ANDROID_LOG_INFO, "MelonDSVulkan3D",
@@ -739,9 +782,11 @@ void VulkanRenderer::Reset() {
     Output.fill(0);
     ReadbackOutput = RawOutput.data();
     ReadbackWriteIndex = 0;
+    OutputCurrent = false;
 }
 
 void VulkanRenderer::SetRenderSettings(GPU::RenderSettings& settings) {
+    OutputCurrent = false;
     BetterPolygons = settings.GL_BetterPolygons;
     const int requested = std::clamp(settings.GL_ScaleFactor, 1, 4);
     if (requested == Scale || !Ready) return;
@@ -755,7 +800,7 @@ void VulkanRenderer::SetRenderSettings(GPU::RenderSettings& settings) {
     }
 }
 
-void VulkanRenderer::UploadMemory() {
+bool VulkanRenderer::UploadMemory() {
     auto* texture = static_cast<u8*>(TextureBuffer.Mapped);
     auto* palette = static_cast<u8*>(PaletteBuffer.Mapped);
     auto textureDirty = GPU::VRAMDirty_Texture.DeriveState(GPU::VRAMMap_Texture);
@@ -771,134 +816,352 @@ void VulkanRenderer::UploadMemory() {
     CopyDirtyRegions(palette, GPU::VRAMFlat_TexPal, paletteDirty);
     if (textureChanged) Flush(TextureBuffer);
     if (paletteChanged) Flush(PaletteBuffer);
+    return textureChanged || paletteChanged;
 }
 
 u32 VulkanRenderer::AddVertex(Polygon* polygon, u32 index) {
     Vertex* vertex = polygon->Vertices[index];
-    u32 z = polygon->FinalZ[index];
+    const u32 z = polygon->FinalZ[index];
     const u32 w = polygon->FinalW[index];
-    u32 shift = 0;
-    while (z > 0xffff) { z >>= 1; ++shift; }
-    u32 x = Scale > 1 ? (vertex->HiresPosition[0] * Scale) >> 4 : vertex->FinalPosition[0];
-    u32 y = Scale > 1 ? (vertex->HiresPosition[1] * Scale) >> 4 : vertex->FinalPosition[1];
-    u32 attr = polygon->Attr & 0x1f00c8f0;
-    if (polygon->FacingView) attr |= 1 << 8;
-    if (polygon->WBuffer) attr |= 1 << 9;
-    attr |= shift << 16;
+    const u32 x = (Scale > 1 ? (vertex->HiresPosition[0] * Scale) >> 4 : vertex->FinalPosition[0]) << 4;
+    const u32 y = (Scale > 1 ? (vertex->HiresPosition[1] * Scale) >> 4 : vertex->FinalPosition[1]) << 4;
+    const u32 attr = PolygonAttr(polygon);
     const u32 alpha = (polygon->Attr >> 16) & 31;
-    Vertices.push_back({x | (y << 16), z | (w << 16),
+    VertexOut[VertexCount++] = {x | (y << 16), z, w,
         static_cast<u32>(vertex->FinalColor[0] >> 1)
                 | (static_cast<u32>(vertex->FinalColor[1] >> 1) << 8)
                 | (static_cast<u32>(vertex->FinalColor[2] >> 1) << 16) | (alpha << 24),
         static_cast<u16>(vertex->TexCoords[0])
                 | (static_cast<u32>(static_cast<u16>(vertex->TexCoords[1])) << 16),
-        attr, polygon->TexParam, polygon->TexPalette});
-    return static_cast<u32>(Vertices.size() - 1);
+        attr, polygon->TexParam, polygon->TexPalette, 0, 0, 0};
+    return VertexCount - 1;
+}
+
+// At 1x, polygons are rasterized the way the DS (and melonDS's software renderer) does it:
+// the edges are stepped scanline by scanline with SoftRenderer's own Slope and Interpolator,
+// and each scanline's span becomes one quad. The GPU then only fills spans, interpolating
+// across them, so every polygon covers exactly the pixels it covers on the DS. Drawing the
+// polygons as plain triangles instead covers fewer pixels along their edges, because the DS
+// fills whole edge pixels (all of them when edge marking or antialiasing is on, as in the
+// Pokémon games); where meshes meet with T-junctions or vertices rounded apart, that left
+// one-pixel cracks of whatever lies behind. The quads also put the attributes where the DS
+// samples them: values are interpolated along the edges per scanline exactly as on the DS,
+// and the quad is shifted half a pixel so that the GPU's pixel centers fall on the DS's
+// integer sample positions.
+bool VulkanRenderer::AddPolygonSpans(Polygon* polygon) {
+    const u32 alpha = (polygon->Attr >> 16) & 31;
+    // Wireframe polygons (alpha 0) only draw their edges on the DS; they are left out.
+    if (alpha == 0) return false;
+    const s32 ytop = polygon->YTop;
+    const s32 ybottom = polygon->YBottom == ytop ? ytop + 1 : polygon->YBottom;
+    const size_t rows = static_cast<size_t>(std::max(ybottom - ytop, 0));
+    if (rows == 0 || VertexCount + rows * 4 > MaxVertices
+            || IndexCount + rows * 6 > MaxIndices) return false;
+
+    using Soft = SoftRenderer;
+    Soft::RendererPolygon rp{};
+    const u32 count = polygon->NumVertices;
+    auto vertexX = [&](u32 index) { return polygon->Vertices[index]->FinalPosition[0]; };
+    auto vertexY = [&](u32 index) { return polygon->Vertices[index]->FinalPosition[1]; };
+    // SoftRenderer::SetupPolygonLeftEdge/RightEdge.
+    auto setupLeft = [&](s32 y) {
+        while (y >= vertexY(rp.NextVL) && rp.CurVL != polygon->VBottom) {
+            rp.CurVL = rp.NextVL;
+            rp.NextVL = polygon->FacingView ? (rp.CurVL + 1 >= count ? 0 : rp.CurVL + 1)
+                                            : (rp.CurVL == 0 ? count - 1 : rp.CurVL - 1);
+        }
+        rp.XL = rp.SlopeL.Setup(vertexX(rp.CurVL), vertexX(rp.NextVL), vertexY(rp.CurVL),
+                                vertexY(rp.NextVL), polygon->FinalW[rp.CurVL],
+                                polygon->FinalW[rp.NextVL], y);
+    };
+    auto setupRight = [&](s32 y) {
+        while (y >= vertexY(rp.NextVR) && rp.CurVR != polygon->VBottom) {
+            rp.CurVR = rp.NextVR;
+            rp.NextVR = polygon->FacingView ? (rp.CurVR == 0 ? count - 1 : rp.CurVR - 1)
+                                            : (rp.CurVR + 1 >= count ? 0 : rp.CurVR + 1);
+        }
+        rp.XR = rp.SlopeR.Setup(vertexX(rp.CurVR), vertexX(rp.NextVR), vertexY(rp.CurVR),
+                                vertexY(rp.NextVR), polygon->FinalW[rp.CurVR],
+                                polygon->FinalW[rp.NextVR], y);
+    };
+
+    // SoftRenderer::SetupPolygon.
+    rp.PolyData = polygon;
+    rp.CurVL = rp.CurVR = polygon->VTop;
+    if (polygon->FacingView) {
+        rp.NextVL = rp.CurVL + 1 >= count ? 0 : rp.CurVL + 1;
+        rp.NextVR = rp.CurVR == 0 ? count - 1 : rp.CurVR - 1;
+    } else {
+        rp.NextVL = rp.CurVL == 0 ? count - 1 : rp.CurVL - 1;
+        rp.NextVR = rp.CurVR + 1 >= count ? 0 : rp.CurVR + 1;
+    }
+    const bool flat = polygon->YBottom == polygon->YTop;
+    if (flat) {
+        u32 left = 0;
+        u32 right = 0;
+        for (u32 i : {1u, count - 1}) {
+            if (vertexX(i) < vertexX(left)) left = i;
+            if (vertexX(i) > vertexX(right)) right = i;
+        }
+        rp.CurVL = rp.NextVL = left;
+        rp.CurVR = rp.NextVR = right;
+        rp.XL = rp.SlopeL.SetupDummy(vertexX(left));
+        rp.XR = rp.SlopeR.SetupDummy(vertexX(right));
+    } else {
+        setupLeft(ytop);
+        setupRight(ytop);
+    }
+
+    const u32 attr = PolygonAttr(polygon);
+    const bool wbuffer = polygon->WBuffer;
+    // Edges are always filled with edge marking or antialiasing; otherwise by slope.
+    const bool fillAllEdges = (RenderDispCnt & ((1 << 4) | (1 << 5))) != 0;
+    for (s32 y = ytop; y < ybottom; ++y) {
+        // SoftRenderer::RenderPolygonScanline.
+        if (!flat) {
+            if (y >= vertexY(rp.NextVL) && rp.CurVL != polygon->VBottom) setupLeft(y);
+            if (y >= vertexY(rp.NextVR) && rp.CurVR != polygon->VBottom) setupRight(y);
+        }
+        bool fillLeft = true;
+        bool fillRight = true;
+        if (!fillAllEdges) {
+            fillLeft = rp.SlopeL.Negative || !rp.SlopeL.XMajor;
+            fillRight = (!rp.SlopeR.Negative && rp.SlopeR.XMajor) || rp.SlopeR.Increment == 0;
+        }
+        s32 wl = rp.SlopeL.Interp.Interpolate(polygon->FinalW[rp.CurVL], polygon->FinalW[rp.NextVL]);
+        s32 wr = rp.SlopeR.Interp.Interpolate(polygon->FinalW[rp.CurVR], polygon->FinalW[rp.NextVR]);
+        s32 zl = rp.SlopeL.Interp.InterpolateZ(polygon->FinalZ[rp.CurVL], polygon->FinalZ[rp.NextVL], wbuffer);
+        s32 zr = rp.SlopeR.Interp.InterpolateZ(polygon->FinalZ[rp.CurVR], polygon->FinalZ[rp.NextVR], wbuffer);
+        s32 xstart = rp.XL;
+        s32 xend = rp.XR;
+        Vertex* leftCurrent;
+        Vertex* leftNext;
+        Vertex* rightCurrent;
+        Vertex* rightNext;
+        Soft::Interpolator<1>* interpStart;
+        Soft::Interpolator<1>* interpEnd;
+        s32 leftLength = 1, rightLength = 1, coverage;
+        if (xstart > xend) {
+            leftCurrent = polygon->Vertices[rp.CurVR];
+            leftNext = polygon->Vertices[rp.NextVR];
+            rightCurrent = polygon->Vertices[rp.CurVL];
+            rightNext = polygon->Vertices[rp.NextVL];
+            interpStart = &rp.SlopeR.Interp;
+            interpEnd = &rp.SlopeL.Interp;
+            std::swap(xstart, xend);
+            std::swap(wl, wr);
+            std::swap(zl, zr);
+            std::swap(fillLeft, fillRight);
+        } else {
+            leftCurrent = polygon->Vertices[rp.CurVL];
+            leftNext = polygon->Vertices[rp.NextVL];
+            rightCurrent = polygon->Vertices[rp.CurVR];
+            rightNext = polygon->Vertices[rp.NextVR];
+            interpStart = &rp.SlopeL.Interp;
+            interpEnd = &rp.SlopeR.Interp;
+            // Edge lengths only matter for an edge that is not filled.
+            if (!fillLeft || !fillRight) {
+                rp.SlopeL.EdgeParams(&leftLength, &coverage);
+                rp.SlopeR.EdgeParams(&rightLength, &coverage);
+            }
+        }
+
+        // The pixels the three parts of the software renderer's scanline loop visit.
+        s32 x = std::max(xstart, 0);
+        s32 first = -1;
+        s32 last = -1;
+        const s32 leftLimit = std::min({xstart + leftLength, xend + 1, 256});
+        if (!fillLeft) {
+            x = std::min(leftLimit, xend - rightLength + 1);
+        } else if (x < leftLimit) {
+            first = x;
+            last = leftLimit;
+            x = leftLimit;
+        }
+        const s32 innerLimit = std::min({xend - rightLength + 1, xend + 1, 256});
+        if (x < innerLimit) {
+            if (first < 0) first = x;
+            last = innerLimit;
+            x = innerLimit;
+        }
+        const s32 rightLimit = std::min(xend + 1, 256);
+        if (fillRight && x < rightLimit) {
+            if (first < 0) first = x;
+            last = rightLimit;
+        }
+        first = std::max(first, 0);
+
+        if (last > first) {
+            const s32 rl = interpStart->Interpolate(leftCurrent->FinalColor[0], leftNext->FinalColor[0]);
+            const s32 gl = interpStart->Interpolate(leftCurrent->FinalColor[1], leftNext->FinalColor[1]);
+            const s32 bl = interpStart->Interpolate(leftCurrent->FinalColor[2], leftNext->FinalColor[2]);
+            const s32 sl = interpStart->Interpolate(leftCurrent->TexCoords[0], leftNext->TexCoords[0]);
+            const s32 tl = interpStart->Interpolate(leftCurrent->TexCoords[1], leftNext->TexCoords[1]);
+            const s32 rr = interpEnd->Interpolate(rightCurrent->FinalColor[0], rightNext->FinalColor[0]);
+            const s32 gr = interpEnd->Interpolate(rightCurrent->FinalColor[1], rightNext->FinalColor[1]);
+            const s32 br = interpEnd->Interpolate(rightCurrent->FinalColor[2], rightNext->FinalColor[2]);
+            const s32 sr = interpEnd->Interpolate(rightCurrent->TexCoords[0], rightNext->TexCoords[0]);
+            const s32 tr = interpEnd->Interpolate(rightCurrent->TexCoords[1], rightNext->TexCoords[1]);
+
+            // Attributes at both ends of the visible part of the span, at the DS's sample
+            // positions (with its own rounding); the GPU interpolates between them,
+            // perspective-correctly with W.
+            Soft::Interpolator<0> interpX(xstart, xend + 1, wl, wr);
+            const u32 base = VertexCount;
+            // Z-buffered depth is computed per pixel in the fragment shader with the DS's own
+            // integer interpolation across the span, from the span's edge values, so depth
+            // tests come out exactly as on the DS. (Interpolating linearly on the GPU instead
+            // flipped them where two surfaces are almost at the same depth, as the haze and
+            // the ground at the horizon of Pokémon's battle backgrounds: a dashed line.)
+            const u32 spanX = wbuffer ? 0u
+                    : static_cast<u32>(xstart) | (static_cast<u32>(xend + 1 - xstart) << 16);
+            for (s32 end : {first, last}) {
+                interpX.SetX(end);
+                s32 z = interpX.InterpolateZ(zl, zr, wbuffer);
+                s32 w = wl;
+                if (wl != wr && end != xstart) {
+                    // W itself is perspective-correct: 1/W is linear across the span.
+                    const float f = static_cast<float>(end - xstart)
+                            / static_cast<float>(xend + 1 - xstart);
+                    w = static_cast<s32>(static_cast<float>(wl) * static_cast<float>(wr)
+                            / ((1.0f - f) * static_cast<float>(wr) + f * static_cast<float>(wl)) + 0.5f);
+                }
+                const s32 r = interpX.Interpolate(rl, rr);
+                const s32 g = interpX.Interpolate(gl, gr);
+                const s32 b = interpX.Interpolate(bl, br);
+                const s32 s = interpX.Interpolate(sl, sr);
+                const s32 t = interpX.Interpolate(tl, tr);
+                z = std::clamp(z, 0, 0xffffff);
+                const u32 packedW = static_cast<u32>(std::clamp(w, 1, 0xffff));
+                const u32 color = static_cast<u32>(r >> 1) | (static_cast<u32>(g >> 1) << 8)
+                        | (static_cast<u32>(b >> 1) << 16) | (alpha << 24);
+                const u32 texcoord = static_cast<u16>(s) | (static_cast<u32>(static_cast<u16>(t)) << 16);
+                const u32 px = static_cast<u32>(end) * 16 + 8;
+                for (s32 row : {y, y + 1}) {
+                    VertexOut[VertexCount++] = {px | (static_cast<u32>(row * 16) << 16),
+                            static_cast<u32>(z), packedW, color, texcoord,
+                            attr, polygon->TexParam, polygon->TexPalette,
+                            static_cast<u32>(zl), static_cast<u32>(zr), spanX};
+                }
+            }
+            // base+0/1: first end (top/bottom), base+2/3: last end (top/bottom).
+            for (u32 index : {0u, 2u, 1u, 1u, 2u, 3u}) IndexOut[IndexCount++] = base + index;
+        }
+
+        rp.XL = rp.SlopeL.Step();
+        rp.XR = rp.SlopeR.Step();
+    }
+    return true;
+}
+
+void VulkanRenderer::AddPolygonTriangles(Polygon* polygon, bool line) {
+    const bool splitAroundCenter = BetterPolygons && !line && polygon->NumVertices > 3;
+    std::array<u32, 10> vertexIndices{};
+    u32 centerIndex = 0;
+    if (splitAroundCenter) {
+        u32 centerX = 0;
+        u32 centerY = 0;
+        float centerZ = 0.0f;
+        float reciprocalW = 0.0f;
+        float centerR = 0.0f;
+        float centerG = 0.0f;
+        float centerB = 0.0f;
+        float centerS = 0.0f;
+        float centerT = 0.0f;
+
+        for (u32 vertex = 0; vertex < polygon->NumVertices; ++vertex) {
+            const Vertex* source = polygon->Vertices[vertex];
+            centerX += source->HiresPosition[0];
+            centerY += source->HiresPosition[1];
+            const float weightedW = static_cast<float>(polygon->FinalW[vertex])
+                    * polygon->NumVertices;
+            reciprocalW += 1.0f / weightedW;
+            centerZ += polygon->WBuffer
+                    ? static_cast<float>(polygon->FinalZ[vertex]) / weightedW
+                    : static_cast<float>(polygon->FinalZ[vertex]);
+            centerR += static_cast<float>(source->FinalColor[0] >> 1) / weightedW;
+            centerG += static_cast<float>(source->FinalColor[1] >> 1) / weightedW;
+            centerB += static_cast<float>(source->FinalColor[2] >> 1) / weightedW;
+            centerS += static_cast<float>(source->TexCoords[0]) / weightedW;
+            centerT += static_cast<float>(source->TexCoords[1]) / weightedW;
+        }
+
+        centerX = ((centerX / polygon->NumVertices) * Scale) >> 4;
+        centerY = ((centerY / polygon->NumVertices) * Scale) >> 4;
+        const float centerW = 1.0f / reciprocalW;
+        centerZ = polygon->WBuffer ? centerZ * centerW
+                                   : centerZ / polygon->NumVertices;
+        centerR *= centerW;
+        centerG *= centerW;
+        centerB *= centerW;
+        centerS *= centerW;
+        centerT *= centerW;
+
+        const u32 z = static_cast<u32>(centerZ);
+        const u32 attr = PolygonAttr(polygon);
+        const u32 alpha = (polygon->Attr >> 16) & 31;
+        VertexOut[VertexCount++] = {(centerX << 4) | (centerY << 20), z, static_cast<u32>(centerW),
+                static_cast<u32>(centerR)
+                        | (static_cast<u32>(centerG) << 8)
+                        | (static_cast<u32>(centerB) << 16) | (alpha << 24),
+                static_cast<u16>(static_cast<s32>(centerS))
+                        | (static_cast<u32>(static_cast<u16>(static_cast<s32>(centerT)))
+                           << 16),
+                attr, polygon->TexParam, polygon->TexPalette, 0, 0, 0};
+        centerIndex = VertexCount - 1;
+    }
+    for (u32 vertex = 0; vertex < polygon->NumVertices; ++vertex)
+        vertexIndices[vertex] = AddVertex(polygon, vertex);
+    if (line) {
+        if (polygon->NumVertices >= 2) {
+            IndexOut[IndexCount++] = vertexIndices[0];
+            IndexOut[IndexCount++] = vertexIndices[1];
+        }
+    } else if (splitAroundCenter) {
+        for (u32 vertex = 1; vertex < polygon->NumVertices; ++vertex) {
+            IndexOut[IndexCount++] = centerIndex;
+            IndexOut[IndexCount++] = vertexIndices[vertex - 1];
+            IndexOut[IndexCount++] = vertexIndices[vertex];
+        }
+        IndexOut[IndexCount++] = centerIndex;
+        IndexOut[IndexCount++] = vertexIndices[polygon->NumVertices - 1];
+        IndexOut[IndexCount++] = vertexIndices[0];
+    } else {
+        for (u32 vertex = 2; vertex < polygon->NumVertices; ++vertex) {
+            IndexOut[IndexCount++] = vertexIndices[0];
+            IndexOut[IndexCount++] = vertexIndices[vertex - 1];
+            IndexOut[IndexCount++] = vertexIndices[vertex];
+        }
+    }
 }
 
 void VulkanRenderer::BuildPolygons() {
-    Vertices.clear();
-    Indices.clear();
+    VertexOut = static_cast<VertexGPU*>(VertexBuffer.Mapped);
+    IndexOut = static_cast<u32*>(IndexBuffer.Mapped);
+    VertexCount = 0;
+    IndexCount = 0;
     Draws.clear();
     for (u32 i = 0; i < RenderNumPolygons; ++i) {
         Polygon* polygon = RenderPolygonRAM[i];
-        const bool splitAroundCenter = polygon && BetterPolygons && polygon->Type != 1
-                && polygon->NumVertices > 3;
-        const size_t requiredVertices = polygon
-                ? polygon->NumVertices + (splitAroundCenter ? 1u : 0u) : 0u;
-        if (!polygon || polygon->Degenerate || polygon->IsShadowMask
-                || Vertices.size() + requiredVertices > MaxVertices) continue;
+        if (!polygon || polygon->Degenerate || polygon->IsShadowMask) continue;
+        // The span path checks its own room; the triangle path needs one vertex more than
+        // the polygon has when it is split around its center.
+        if (Scale > 1 && VertexCount + polygon->NumVertices + 1 > MaxVertices) continue;
         DrawCall draw{};
-        draw.FirstIndex = static_cast<u32>(Indices.size());
+        draw.FirstIndex = static_cast<u32>(IndexCount);
         draw.Translucent = polygon->Translucent;
         draw.DepthEqual = (polygon->Attr & (1 << 14)) != 0;
         draw.DepthWrite = !polygon->Translucent || (polygon->Attr & (1 << 11));
         draw.Line = polygon->Type == 1;
         draw.WBuffer = polygon->WBuffer;
-        std::array<u32, 10> vertexIndices{};
-        u32 centerIndex = 0;
-        if (splitAroundCenter) {
-            u32 centerX = 0;
-            u32 centerY = 0;
-            float centerZ = 0.0f;
-            float reciprocalW = 0.0f;
-            float centerR = 0.0f;
-            float centerG = 0.0f;
-            float centerB = 0.0f;
-            float centerS = 0.0f;
-            float centerT = 0.0f;
-
-            for (u32 vertex = 0; vertex < polygon->NumVertices; ++vertex) {
-                const Vertex* source = polygon->Vertices[vertex];
-                centerX += source->HiresPosition[0];
-                centerY += source->HiresPosition[1];
-                const float weightedW = static_cast<float>(polygon->FinalW[vertex])
-                        * polygon->NumVertices;
-                reciprocalW += 1.0f / weightedW;
-                centerZ += polygon->WBuffer
-                        ? static_cast<float>(polygon->FinalZ[vertex]) / weightedW
-                        : static_cast<float>(polygon->FinalZ[vertex]);
-                centerR += static_cast<float>(source->FinalColor[0] >> 1) / weightedW;
-                centerG += static_cast<float>(source->FinalColor[1] >> 1) / weightedW;
-                centerB += static_cast<float>(source->FinalColor[2] >> 1) / weightedW;
-                centerS += static_cast<float>(source->TexCoords[0]) / weightedW;
-                centerT += static_cast<float>(source->TexCoords[1]) / weightedW;
-            }
-
-            centerX = ((centerX / polygon->NumVertices) * Scale) >> 4;
-            centerY = ((centerY / polygon->NumVertices) * Scale) >> 4;
-            const float centerW = 1.0f / reciprocalW;
-            centerZ = polygon->WBuffer ? centerZ * centerW
-                                       : centerZ / polygon->NumVertices;
-            centerR *= centerW;
-            centerG *= centerW;
-            centerB *= centerW;
-            centerS *= centerW;
-            centerT *= centerW;
-
-            u32 z = static_cast<u32>(centerZ);
-            u32 shift = 0;
-            while (z > 0xffff) { z >>= 1; ++shift; }
-            u32 attr = polygon->Attr & 0x1f00c8f0;
-            if (polygon->FacingView) attr |= 1 << 8;
-            if (polygon->WBuffer) attr |= 1 << 9;
-            attr |= shift << 16;
-            const u32 alpha = (polygon->Attr >> 16) & 31;
-            Vertices.push_back({centerX | (centerY << 16),
-                    z | (static_cast<u32>(centerW) << 16),
-                    static_cast<u32>(centerR)
-                            | (static_cast<u32>(centerG) << 8)
-                            | (static_cast<u32>(centerB) << 16) | (alpha << 24),
-                    static_cast<u16>(static_cast<s32>(centerS))
-                            | (static_cast<u32>(static_cast<u16>(static_cast<s32>(centerT)))
-                               << 16),
-                    attr, polygon->TexParam, polygon->TexPalette});
-            centerIndex = static_cast<u32>(Vertices.size() - 1);
-        }
-        for (u32 vertex = 0; vertex < polygon->NumVertices; ++vertex)
-            vertexIndices[vertex] = AddVertex(polygon, vertex);
-        if (draw.Line) {
-            if (polygon->NumVertices >= 2) {
-                Indices.push_back(static_cast<u16>(vertexIndices[0]));
-                Indices.push_back(static_cast<u16>(vertexIndices[1]));
-            }
-        } else if (splitAroundCenter) {
-            for (u32 vertex = 1; vertex < polygon->NumVertices; ++vertex) {
-                Indices.push_back(static_cast<u16>(centerIndex));
-                Indices.push_back(static_cast<u16>(vertexIndices[vertex - 1]));
-                Indices.push_back(static_cast<u16>(vertexIndices[vertex]));
-            }
-            Indices.push_back(static_cast<u16>(centerIndex));
-            Indices.push_back(static_cast<u16>(vertexIndices[polygon->NumVertices - 1]));
-            Indices.push_back(static_cast<u16>(vertexIndices[0]));
+        draw.PolygonID = static_cast<u8>((polygon->Attr >> 24) & 0x3f);
+        if (Scale == 1) {
+            draw.Line = false;
+            if (!AddPolygonSpans(polygon)) continue;
         } else {
-            for (u32 vertex = 2; vertex < polygon->NumVertices; ++vertex) {
-                Indices.push_back(static_cast<u16>(vertexIndices[0]));
-                Indices.push_back(static_cast<u16>(vertexIndices[vertex - 1]));
-                Indices.push_back(static_cast<u16>(vertexIndices[vertex]));
-            }
+            AddPolygonTriangles(polygon, draw.Line);
         }
-        draw.IndexCount = static_cast<u32>(Indices.size()) - draw.FirstIndex;
+        draw.IndexCount = static_cast<u32>(IndexCount) - draw.FirstIndex;
         if (draw.IndexCount) {
             // Texture formats can make an otherwise opaque polygon partially translucent.
             // The DS first writes its fully opaque texels to depth, then blends the rest.
@@ -910,7 +1173,7 @@ void VulkanRenderer::BuildPolygons() {
             }
             Draws.push_back(draw);
         }
-        if (Indices.size() >= MaxIndices) break;
+        if (IndexCount >= MaxIndices) break;
     }
 }
 
@@ -947,19 +1210,28 @@ bool VulkanRenderer::CompleteSubmission() {
 
 void VulkanRenderer::RenderFrame() {
     if (!Ready) return;
-    const auto buildStart = TraceClock::now();
-    // Polygon preparation only writes CPU-side vectors. Do it before waiting for the previous
-    // GPU submission so the work can overlap when the queue is still finishing its readback.
-    BuildPolygons();
-    const auto buildEnd = TraceClock::now();
-    const auto waitStart = buildEnd;
+    // The previous frame's GPU work has normally finished long ago (a whole DS frame of
+    // emulation ran since its submit), so waiting first costs nothing and lets the polygons
+    // be written straight into the mapped vertex and index buffers.
+    const auto waitStart = TraceClock::now();
     if (!CompleteSubmission()) return;
     const auto waitEnd = TraceClock::now();
-    const u64 buildNanoseconds = ElapsedNanoseconds(buildStart, buildEnd);
     const u64 waitNanoseconds = ElapsedNanoseconds(waitStart, waitEnd);
 
-    // Most menus are entirely 2D. Avoid a Vulkan submit, full VRAM upload and synchronous
-    // readback when the 3D engine has nothing to draw.
+    const auto uploadStart = waitEnd;
+    const bool vramChanged = UploadMemory();
+    // Like the software renderer: when no new geometry was flushed and none of the 3D
+    // registers or textures changed, the last output is still right.
+    if (RenderFrameIdentical && !vramChanged && OutputCurrent) return;
+    OutputCurrent = true;
+
+    const auto buildStart = TraceClock::now();
+    BuildPolygons();
+    const auto buildEnd = TraceClock::now();
+    const u64 buildNanoseconds = ElapsedNanoseconds(buildStart, buildEnd);
+
+    // Most menus are entirely 2D. Avoid a Vulkan submit and readback when the 3D engine has
+    // nothing to draw.
     if (Draws.empty()) {
         const auto expand5 = [](u32 value) { return (value << 3) | (value >> 2); };
         const u32 clear = RenderClearAttr1;
@@ -970,12 +1242,9 @@ void VulkanRenderer::RenderFrame() {
         RawOutput.fill(red | (green << 8) | (blue << 16) | (alpha << 24));
         ReadbackOutput = RawOutput.data();
         RecordTrace(buildNanoseconds, waitNanoseconds, 0, 0, RenderNumPolygons,
-                    Draws.size(), Vertices.size(), true);
+                    Draws.size(), VertexCount, true);
         return;
     }
-
-    const auto uploadStart = TraceClock::now();
-    UploadMemory();
 
     auto* config = static_cast<ShaderConfig*>(UniformBuffer.Mapped);
     std::memset(config, 0, sizeof(*config));
@@ -988,8 +1257,6 @@ void VulkanRenderer::RenderFrame() {
         config->ToonColors[i][1] = static_cast<float>((color >> 5) & 31) / 31.0f;
         config->ToonColors[i][2] = static_cast<float>((color >> 10) & 31) / 31.0f;
     }
-    std::memcpy(VertexBuffer.Mapped, Vertices.data(), Vertices.size() * sizeof(VertexGPU));
-    std::memcpy(IndexBuffer.Mapped, Indices.data(), Indices.size() * sizeof(u16));
     Flush(UniformBuffer);
     Flush(VertexBuffer);
     Flush(IndexBuffer);
@@ -1008,7 +1275,7 @@ void VulkanRenderer::RenderFrame() {
     clears[0].color.float32[2] = static_cast<float>(clear & 31) / 31.0f;
     clears[0].color.float32[3] = static_cast<float>((clear >> 16) & 31) / 31.0f;
     const u32 clearZ = ((RenderClearAttr2 & 0x7fff) * 0x200) + 0x1ff;
-    clears[1].depthStencil = {static_cast<float>(clearZ) / 16777216.0f, 0xff};
+    clears[1].depthStencil = {static_cast<float>(clearZ) / 16777216.0f, 0};
     VkRenderPassBeginInfo renderBegin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     renderBegin.renderPass = RenderPass;
     renderBegin.framebuffer = FramebufferObject;
@@ -1022,15 +1289,21 @@ void VulkanRenderer::RenderFrame() {
     vkCmdSetScissor(CommandBuffer, 0, 1, &scissor);
     const VkDeviceSize offset = 0;
     vkCmdBindVertexBuffers(CommandBuffer, 0, 1, &VertexBuffer.Handle, &offset);
-    vkCmdBindIndexBuffer(CommandBuffer, IndexBuffer.Handle, 0, VK_INDEX_TYPE_UINT16);
+    vkCmdBindIndexBuffer(CommandBuffer, IndexBuffer.Handle, 0, VK_INDEX_TYPE_UINT32);
     vkCmdBindDescriptorSets(CommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, PipelineLayout,
                             0, 1, &DescriptorSet, 0, nullptr);
     VkPipeline current = VK_NULL_HANDLE;
+    u32 currentStencil = ~0u;
     for (const auto& draw : Draws) {
         VkPipeline pipeline = PipelineFor(draw);
         if (pipeline != current) {
             vkCmdBindPipeline(CommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
             current = pipeline;
+        }
+        const u32 stencil = draw.Translucent ? 0x40u | draw.PolygonID : 0u;
+        if (stencil != currentStencil) {
+            vkCmdSetStencilReference(CommandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK, stencil);
+            currentStencil = stencil;
         }
         PushConstants push{draw.WBuffer ? 1u : 0u, draw.Translucent ? 1u : 0u};
         vkCmdPushConstants(CommandBuffer, PipelineLayout,
@@ -1059,6 +1332,16 @@ void VulkanRenderer::RenderFrame() {
     copy.imageExtent = {Width, Height, 1};
     vkCmdCopyImageToBuffer(CommandBuffer, ColorImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            ReadbackBuffers[ReadbackWriteIndex].Handle, 1, &copy);
+    // Makes the copy visible to the CPU's reads once the fence signals.
+    VkBufferMemoryBarrier hostBarrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    hostBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    hostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    hostBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    hostBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    hostBarrier.buffer = ReadbackBuffers[ReadbackWriteIndex].Handle;
+    hostBarrier.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(CommandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                         0, 0, nullptr, 1, &hostBarrier, 0, nullptr);
     vkEndCommandBuffer(CommandBuffer);
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1;
@@ -1073,7 +1356,7 @@ void VulkanRenderer::RenderFrame() {
     RecordTrace(buildNanoseconds, waitNanoseconds,
                 ElapsedNanoseconds(uploadStart, uploadEnd),
                 ElapsedNanoseconds(uploadEnd, submitEnd), RenderNumPolygons,
-                Draws.size(), Vertices.size(), false);
+                Draws.size(), VertexCount, false);
 }
 
 u32* VulkanRenderer::GetLine(int line) {
