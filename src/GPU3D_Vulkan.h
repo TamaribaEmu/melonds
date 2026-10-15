@@ -11,7 +11,11 @@
 #include <vulkan/vulkan.h>
 
 #include <array>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace GPU3D {
@@ -25,6 +29,8 @@ public:
     void DeInit() override;
     void Reset() override;
     void SetRenderSettings(GPU::RenderSettings& settings) override;
+    void VCount144() override { FinishRendering(); }
+    void FinishRendering() override;
     void RenderFrame() override;
     u32* GetLine(int line) override;
     bool ExportSharedContext(MelonDSVulkanSharedContext& context) const;
@@ -49,6 +55,8 @@ private:
     struct DrawCall {
         u32 FirstIndex;
         u32 IndexCount;
+        // At 1x the spans are drawn with the shared quad index pattern from this vertex.
+        s32 VertexOffset;
         bool Translucent;
         bool DepthEqual;
         bool DepthWrite;
@@ -62,6 +70,31 @@ private:
         u32 DispCnt;
         u32 Padding;
         float ToonColors[32][4];
+    };
+
+    // At 1x, the spans a polygon produced, kept for the next frame: games resubmit most of
+    // their geometry unchanged every frame, and a polygon whose inputs are unchanged produces
+    // exactly the same spans again.
+    struct SpanCacheEntry {
+        u64 Hash;
+        u32 KeyOffset;
+        u32 KeySize;
+        u32 FirstVertex;
+        u32 VertexCount;
+    };
+
+    struct SpanCacheSlot {
+        u32 Generation;
+        u32 Entry;
+    };
+
+    struct SpanCache {
+        std::vector<u32> Keys;
+        std::vector<SpanCacheEntry> Entries;
+        std::vector<SpanCacheSlot> Slots;
+        u32 Generation = 1;
+        // Which of SpanVertices holds these entries' vertices.
+        u32 Vertices = 0;
     };
 
     struct Buffer {
@@ -88,9 +121,18 @@ private:
     void DestroyTargets();
     bool UploadMemory();
     void BuildPolygons();
-    bool AddPolygonSpans(Polygon* polygon);
+    void AddPolygonSpans(Polygon* polygon);
+    void BuildPolygonSpans();
+    const SpanCacheEntry* FindSpans(const SpanCache& cache, u64 hash, const u32* key,
+                                    u32 keySize) const;
+    void AddSpanCacheEntry(SpanCache& cache, const SpanCacheEntry& entry);
     void AddPolygonTriangles(Polygon* polygon, bool line);
     bool CompleteSubmission();
+    void FillEmptyOutput(u32 clear);
+    bool HasDrawablePolygons() const;
+    void BuildAndSubmit();
+    void WorkerMain();
+    void StopWorker();
     u32 AddVertex(Polygon* polygon, u32 index);
     VkPipeline PipelineFor(const DrawCall& draw) const;
     void Flush(Buffer& buffer);
@@ -134,14 +176,26 @@ private:
     Buffer PaletteBuffer;
     Buffer VertexBuffer;
     Buffer IndexBuffer;
+    // Indices of one quad per span (0, 2, 1, 1, 2, 3 from each fourth vertex), enough for the
+    // tallest polygon; every span draw uses them with its own vertex offset.
+    Buffer SpanIndexBuffer;
     std::array<Buffer, 2> ReadbackBuffers{};
 
-    // The frame's geometry, written straight into the mapped vertex and index buffers.
+    // The frame's geometry: at 1x into SpanVertices, upscaled straight into the mapped vertex
+    // and index buffers.
     VertexGPU* VertexOut = nullptr;
     u32* IndexOut = nullptr;
     u32 VertexCount = 0;
     u32 IndexCount = 0;
     std::vector<DrawCall> Draws;
+    // At 1x the frame's span vertices are built in cached memory (two buffers, this frame's
+    // and the previous one's, which cache hits copy from) and then copied into the mapped
+    // vertex buffer in one go. SpanCaches[SpanCacheCurrent ^ 1] describes the previous frame.
+    std::array<std::unique_ptr<VertexGPU[]>, 2> SpanVertices;
+    std::array<SpanCache, 2> SpanCaches;
+    u32 SpanCacheCurrent = 0;
+    // The mapped vertex buffer still holds the previous frame's span vertices.
+    bool SpanVerticesUploaded = false;
     std::array<u32, 256 * 192> RawOutput{};
     std::array<u32, 256 * 192> Output{};
     const u32* ReadbackOutput = RawOutput.data();
@@ -153,6 +207,21 @@ private:
     bool Ready = false;
     bool SubmissionPending = false;
     bool OutputCurrent = false;
+
+    // The thread that builds and submits each frame (see WorkerMain). WorkerBusy is set by
+    // RenderFrame and cleared by the thread when the frame is submitted, under WorkerLock.
+    std::thread Worker;
+    std::mutex WorkerLock;
+    std::condition_variable WorkerWake;
+    std::condition_variable WorkerIdle;
+    bool WorkerBusy = false;
+    bool WorkerQuit = false;
+    // Handed from RenderFrame to the thread for the trace.
+    u64 FrameWaitNanoseconds = 0;
+    u64 FrameUploadNanoseconds = 0;
+    // The thread found nothing to draw after all: the next RenderFrame shows the clear color.
+    bool EmptyFramePending = false;
+    u32 EmptyFrameClear = 0;
 };
 
 } // namespace GPU3D

@@ -156,6 +156,10 @@ public:
     virtual void SetRenderSettings(GPU::RenderSettings& settings) = 0;
 
     virtual void VCount144() {};
+    // Waits until the renderer is done with the polygon and vertex RAM it was given, before a
+    // reset or a savestate replaces them. Only needed by a renderer that still reads them after
+    // RenderFrame returns (the Vulkan renderer's thread).
+    virtual void FinishRendering() {};
 
     virtual void RenderFrame() = 0;
     virtual void RestartFrame() {};

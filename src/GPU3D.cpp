@@ -307,6 +307,8 @@ void ResetRenderingState()
 
 void Reset()
 {
+    if (CurrentRenderer) CurrentRenderer->FinishRendering();
+
     CmdFIFO.Clear();
     CmdPIPE.Clear();
 
@@ -388,6 +390,8 @@ void Reset()
 
 void DoSavestate(Savestate* file)
 {
+    if (!file->Saving && CurrentRenderer) CurrentRenderer->FinishRendering();
+
     file->Section("GP3D");
 
     CmdFIFO.DoSavestate(file);
