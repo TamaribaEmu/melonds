@@ -197,6 +197,10 @@ extern u8 ARM9BIOS[0x1000];
 extern u8 ARM7BIOS[0x4000];
 extern u16 ARM7BIOSProt;
 
+// Tamariba: the DS KEY1 table (0x1048 bytes) a frontend supplies for an ARM7 BIOS that has
+// none at 0x30 (the built-in OpenDS one); nullptr forgets it. Takes effect at the next Reset.
+void SetKey1Table(const u8* table);
+
 extern u8* MainRAM;
 extern u32 MainRAMMask;
 

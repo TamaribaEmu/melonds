@@ -1,13 +1,16 @@
-Custom NDS ARM7/ARM9 BIOS replacement
+BSD 2-Clause License
+
 Copyright (c) 2013, Gilead Kutnick
+Copyright (c) 2026, OpenDS contributors
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without
- modification, are permitted provided that the following conditions are met:
+modification, are permitted provided that the following conditions are met:
 
-1) Redistributions of source code must retain the above copyright notice,
+1. Redistributions of source code must retain the above copyright notice,
    this list of conditions and the following disclaimer.
-2) Redistributions in binary form must reproduce the above copyright notice,
+
+2. Redistributions in binary form must reproduce the above copyright notice,
    this list of conditions and the following disclaimer in the documentation
    and/or other materials provided with the distribution.
 
@@ -22,15 +25,4 @@ INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
 CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
 ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 POSSIBILITY OF SUCH DAMAGE.
-
--- Info --
-
-This archive contains source code and assembly for a custom BIOS replacement
-for the Nintendo DS system. This code is in no way affiliated with Nintendo
-and is not derived from Nintendo's BIOS implementation but has been implemented
-using publically available documentation.
-
-It can be assembled using the included Makefile along with a proper ARM gcc
-toolchain. Change the first four lines to point to the proper toolchain of your
-choice.
 

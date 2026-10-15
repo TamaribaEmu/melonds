@@ -398,6 +398,16 @@ void melonds_set_touch(int pressed, int x, int y)
    external_touch.y = y;
 }
 
+// Tamariba: the DS KEY1 table (0x1048 bytes), for an ARM7 BIOS that has none (the built-in
+// OpenDS one, FreeBIOS.h). Call before retro_load_game; nullptr forgets it.
+extern "C" __attribute__((visibility("default")))
+bool melonds_set_key1(const void* table, size_t size)
+{
+   if (table != nullptr && size != 0x1048) return false;
+   NDS::SetKey1Table(static_cast<const u8*>(table));
+   return true;
+}
+
 void retro_set_controller_port_device(unsigned port, unsigned device)
 {
    log_cb(RETRO_LOG_INFO, "Plugging device %u into port %u.\n", device, port);
@@ -939,7 +949,7 @@ static bool _handle_load_game(unsigned type, const struct retro_game_info *info)
    // Abort if there are any of the required roms are missing
    if(!missing_roms.empty())
    {
-      std::string msg = "Missing bios/firmware in system directory. Using FreeBIOS.";
+      std::string msg = "Missing bios/firmware in system directory. Using the built-in OpenDS BIOS: ";
 
       int i = 0;
       int len = missing_roms.size();

@@ -106,6 +106,10 @@ u32 CPUStop;
 u8 ARM9BIOS[0x1000];
 u8 ARM7BIOS[0x4000];
 
+const u32 Key1TableOffset = 0x30, Key1TableSize = 0x1048;
+u8 Key1Table[Key1TableSize];
+bool HasKey1Table = false;
+
 u8* MainRAM;
 u32 MainRAMMask;
 
@@ -451,6 +455,12 @@ void SetupDirectBoot()
     SetWifiWaitCnt(0x0030);
 }
 
+void SetKey1Table(const u8* table)
+{
+    HasKey1Table = table != nullptr;
+    if (table) memcpy(Key1Table, table, Key1TableSize);
+}
+
 void Reset()
 {
     FILE* f;
@@ -493,6 +503,20 @@ void Reset()
 
         printf("ARM7 BIOS loaded\n");
         fclose(f);
+    }
+
+    // An ARM7 BIOS without the KEY1 table (OpenDS) gets the frontend's, so encrypted secure
+    // areas decrypt (NDSCart::Key1_InitKeycode reads it from here); a BIOS with one keeps it.
+    if (HasKey1Table)
+    {
+        bool empty = true;
+        for (u32 i = 0; i < Key1TableSize && empty; i++)
+            empty = ARM7BIOS[Key1TableOffset + i] == 0;
+        if (empty)
+        {
+            memcpy(&ARM7BIOS[Key1TableOffset], Key1Table, Key1TableSize);
+            printf("ARM7 BIOS: KEY1 table supplied by the frontend\n");
+        }
     }
 
 #ifdef JIT_ENABLED

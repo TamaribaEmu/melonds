@@ -1,5 +1,6 @@
-#  Custom NDS ARM7/ARM9 BIOS replacement
+#  OpenDS - open Nintendo DS ARM7/ARM9 BIOS replacement
 #  Copyright (c) 2013, Gilead Kutnick
+#  OpenDS integration copyright (c) 2026 OpenDS contributors
 #  All rights reserved.
 #  
 #  Redistribution and use in source and binary forms, with or without
@@ -46,10 +47,16 @@ b unhandled_exception                 // 0x1C FIQ
 #endif
 
 #ifdef BIOS_ARM7
-// ARM7 BIOS has encryption stuff at 0x30, we don't want to include it but we'll
-// leave a space for it.
+// The retail ARM7 BIOS has Nintendo's proprietary DS KEY1 seed at 0x30.
+// OpenDS does not distribute that data. A local build may inject a
+// user-supplied 0x1048-byte table with KEY1_FILE.
 
-.fill 0x1058, 0x1, 0x0
+.fill 0x10, 0x1, 0x0
+#ifdef KEY1_FILE
+.incbin KEY1_FILE
+#else
+.fill 0x1048, 0x1, 0x0
+#endif
 #endif
 
 
@@ -590,7 +597,7 @@ swi_bit_unpack:
  0:
   // Reload bit buffer if necessary
   cmp source_bit_buffer, #0x1
-  ldreqb source_bit_buffer, [ source ], #1
+  ldrbeq source_bit_buffer, [ source ], #1
   orreq source_bit_buffer, source_bit_buffer, #0x100
 
   // Get next from source
@@ -1132,4 +1139,3 @@ swi_soft_reset:
 #ifdef BIOS_ARM9
 .org 4096
 #endif
-
