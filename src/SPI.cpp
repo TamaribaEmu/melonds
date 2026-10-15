@@ -318,11 +318,29 @@ void LoadFirmwareFromFile(FILE* f)
     }
 }
 
+// Tamariba: UTF-8 (as the frontend gives it) to the firmware's UTF-16, at most `max` units,
+// rather than one unit per byte, which garbled anything beyond ASCII ("Zoé").
+static std::u16string FirmwareText(const char* text, size_t max)
+{
+    std::u16string out;
+    const unsigned char* p = (const unsigned char*)text;
+    while (*p && out.length() < max)
+    {
+        u32 c = *p++;
+        int more = c >= 0xF0 ? 3 : c >= 0xE0 ? 2 : c >= 0xC0 ? 1 : 0;
+        if (more) c &= 0x3F >> more;
+        for (; more > 0 && (*p & 0xC0) == 0x80; more--) c = (c << 6) | (*p++ & 0x3F);
+        if (more > 0 || c >= 0x10000) c = '?';  // cut short, or beyond what the DS can show
+        out.push_back((char16_t)c);
+    }
+    return out;
+}
+
 void LoadUserSettingsFromConfig() {
-    // setting up username
-    std::string username(Config::FirmwareUsername);
-    std::u16string u16Username(username.begin(), username.end());
-    size_t usernameLength = std::min(u16Username.length(), (size_t) 10);
+    // setting up username (the field cleared first, so a longer old name leaves nothing behind)
+    std::u16string u16Username = FirmwareText(Config::FirmwareUsername, 10);
+    size_t usernameLength = u16Username.length();
+    memset(Firmware + UserSettings + 0x06, 0, 10 * sizeof(char16_t));
     memcpy(Firmware + UserSettings + 0x06, u16Username.data(), usernameLength * sizeof(char16_t));
     Firmware[UserSettings+0x1A] = usernameLength;
 
@@ -337,9 +355,9 @@ void LoadUserSettingsFromConfig() {
     Firmware[UserSettings+0x04] = Config::FirmwareBirthdayDay;
 
     // setup message
-    std::string message(Config::FirmwareMessage);
-    std::u16string u16message(message.begin(), message.end());
-    size_t messageLength = std::min(u16message.length(), (size_t) 26);
+    std::u16string u16message = FirmwareText(Config::FirmwareMessage, 26);
+    size_t messageLength = u16message.length();
+    memset(Firmware + UserSettings + 0x1C, 0, 26 * sizeof(char16_t));
     memcpy(Firmware + UserSettings + 0x1C, u16message.data(), messageLength * sizeof(char16_t));
     Firmware[UserSettings+0x50] = messageLength;
 }

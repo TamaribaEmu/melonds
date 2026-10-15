@@ -736,6 +736,40 @@ static void check_variables(bool init)
          Config::FirmwareLanguage = 5;
    }
 
+   // Tamariba: the DS's user settings, the profile's own (its name, birthday "<month>/<day>",
+   // favourite colour and message). Not player-facing options; Tamariba sets them. With them,
+   // they are the DS's settings even over a firmware.bin's own (SPI.cpp).
+   var.key = "melonds_profile_name";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      strlcpy(Config::FirmwareUsername, var.value, sizeof(Config::FirmwareUsername));
+      Config::FirmwareOverrideSettings = true;
+      Config::FirmwareMessage[0] = '\0';
+      Config::FirmwareBirthdayMonth = 1;
+      Config::FirmwareBirthdayDay = 1;
+
+      var.key = "melonds_profile_birthday";
+      var.value = NULL;
+      int month = 0, day = 0;
+      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value &&
+          sscanf(var.value, "%d/%d", &month, &day) == 2 && month >= 1 && month <= 12 && day >= 1 && day <= 31)
+      {
+         Config::FirmwareBirthdayMonth = month;
+         Config::FirmwareBirthdayDay = day;
+      }
+
+      var.key = "melonds_profile_colour";
+      var.value = NULL;
+      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+         Config::FirmwareFavouriteColour = atoi(var.value) & 0xF;
+
+      var.key = "melonds_profile_message";
+      var.value = NULL;
+      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+         strlcpy(Config::FirmwareMessage, var.value, sizeof(Config::FirmwareMessage));
+   }
+
    if (input_state.current_touch_mode != new_touch_mode)
       input_state.cursor_visible = false;
    input_state.current_touch_mode = new_touch_mode;
